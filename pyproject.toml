@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibescholar-mcp"
+version = "0.1.0"
+description = "MCP server exposing a VibeScholar PDF corpus to Claude Code"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "faiss-cpu>=1.8.0",
+    "fastembed>=0.5.0",
+    "pypdf>=5.0.0",
+    "FlashRank>=0.2.0",
+    "numpy",
+]
+
+[tool.setuptools.packages.find]
+include = ["vibescholar*"]

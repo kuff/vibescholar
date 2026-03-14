@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Test papers (large PDFs)
+tests/test_papers/
+
+# Data / index artifacts
+*.faiss
+*.npy
+*.db
+
+# Singularity
+*.sif
+
+# OS
+.DS_Store
+Thumbs.db

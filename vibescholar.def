@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: continuumio/miniconda3:latest
+
+%post
+    conda install -y python=3.11 -c conda-forge
+    pip install --no-cache-dir \
+        faiss-cpu>=1.8.0 \
+        fastembed>=0.5.0 \
+        pypdf>=5.0.0 \
+        FlashRank>=0.2.0 \
+        numpy
+    conda clean -afy
+    pip cache purge
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
