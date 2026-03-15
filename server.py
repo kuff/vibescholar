@@ -251,4 +251,24 @@ def list_indexed() -> str:
 # ── Entry point ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+    )
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+
+    if args.transport != "stdio":
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        # Allow connections from any host when serving over the network
+        mcp.settings.transport_security.enable_dns_rebinding_protection = False
+        # Stateless mode: no session affinity required (needed for Tailscale Funnel)
+        mcp.settings.stateless_http = True
+
+    mcp.run(transport=args.transport)

@@ -31,3 +31,6 @@ tests/test_papers/
 # OS
 .DS_Store
 Thumbs.db
+
+# Machine-specific startup script (contains local paths)
+start-mcp-service.bat
