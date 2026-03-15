@@ -1,16 +1,25 @@
 Bootstrap: docker
-From: continuumio/miniconda3:latest
+From: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 
 %post
-    conda install -y python=3.11 -c conda-forge
-    pip install --no-cache-dir \
-        faiss-cpu>=1.8.0 \
-        fastembed>=0.5.0 \
-        pypdf>=5.0.0 \
-        FlashRank>=0.2.0 \
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip curl && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --no-cache-dir \
+        'faiss-cpu>=1.8.0' \
+        'fastembed>=0.5.0' \
+        'pypdf>=5.0.0' \
+        'FlashRank>=0.2.0' \
         numpy
-    conda clean -afy
-    pip cache purge
+
+    # Replace CPU onnxruntime with GPU version for CUDA 12
+    python -m pip install --no-cache-dir --force-reinstall --no-deps \
+        onnxruntime-gpu --extra-index-url \
+        https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
 %environment
-    export PATH=/opt/conda/bin:$PATH
+    export PATH=/usr/bin:$PATH
+    export LC_ALL=C
