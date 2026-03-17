@@ -33,7 +33,12 @@ mcp = FastMCP("vibescholar")
 
 # ── Lazy backend ────────────────────────────────────────────────────
 class _Backend:
-    """Lazily-initialized wrapper around the VibeScholar search stack."""
+    """Lazily-initialized wrapper around the VibeScholar search stack.
+
+    Only the database is opened eagerly (cheap).  The embedding model, FAISS
+    index, and search service are loaded on first use so that lightweight
+    operations like ``list_indexed`` stay fast.
+    """
 
     def __init__(self) -> None:
         data_dir_env = os.environ.get("VIBESCHOLAR_DATA_DIR")
@@ -45,18 +50,45 @@ class _Backend:
         config.ensure_data_dirs()
 
         from vibescholar.db import IndexDatabase
+
+        self._config = config
+        self.db = IndexDatabase(config.DB_PATH)
+        self._file_map = self._build_file_map()
+
+        # Heavy components are loaded lazily via properties below.
+        self._embedder = None
+        self._store = None
+        self._search_service = None
+
+    def _ensure_search_stack(self) -> None:
+        """Load the embedding model, FAISS index, and search service (once)."""
+        if self._embedder is not None:
+            return
+
         from vibescholar.embeddings import Embedder
         from vibescholar.vectors import FaissStore
         from vibescholar.search import SearchService
 
         logger.info("Loading embedding model...")
-        self.embedder = Embedder()
-        self.db = IndexDatabase(config.DB_PATH)
-        self.store = FaissStore(config.FAISS_INDEX_PATH, self.embedder.dimension)
-        self.search_service = SearchService(self.db, self.embedder, self.store)
+        self._embedder = Embedder()
+        self._store = FaissStore(self._config.FAISS_INDEX_PATH, self._embedder.dimension)
+        self._search_service = SearchService(self.db, self._embedder, self._store)
+        logger.info("Search stack ready (%d vectors)", self._store.ntotal)
 
-        self._file_map = self._build_file_map()
-        logger.info("Backend ready (%d vectors)", self.store.ntotal)
+    @property
+    def embedder(self):
+        self._ensure_search_stack()
+        return self._embedder
+
+    @property
+    def store(self):
+        self._ensure_search_stack()
+        return self._store
+
+    @property
+    def search_service(self):
+        self._ensure_search_stack()
+        return self._search_service
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -242,8 +274,7 @@ def list_indexed() -> str:
         parts.append(section)
 
     total_chunks = backend.db.total_chunk_count()
-    total_vectors = backend.store.ntotal
-    parts.append(f"Totals: {total_chunks} chunks, {total_vectors} vectors")
+    parts.append(f"Totals: {total_chunks} chunks")
 
     return "\n\n".join(parts)
 
