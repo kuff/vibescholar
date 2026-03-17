@@ -259,7 +259,7 @@ if __name__ == "__main__":
         choices=["stdio", "sse", "streamable-http"],
         default="stdio",
     )
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 

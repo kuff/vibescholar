@@ -91,6 +91,18 @@ python query.py --stats
 python query.py --stats --data-dir /path/to/custom/data
 ```
 
+## Benchmarking
+
+```bash
+python benchmark.py                    # default queries, top_k=5, 3 rounds
+python benchmark.py --top_k 10         # custom top_k
+python benchmark.py --rounds 5         # repeat each query N times
+python benchmark.py --no-rerank        # skip cross-encoder reranking
+python benchmark.py --queries "query1" "query2"  # custom queries
+```
+
+Reports per-stage latency breakdown (embedding, FAISS, FTS5, RRF, DB fetch, reranking, snippets) with mean/median/P95/min/max statistics.
+
 ## Configuration
 
 | Environment Variable | Default | Description |
@@ -128,5 +140,10 @@ vibescholar/
   text.py        # Text utilities (clean_text, chunk_text)
 server.py        # MCP server entry point (3 tools)
 query.py         # CLI testing utility
+benchmark.py     # Search latency benchmarking
 tests/           # 81 tests across 6 test files
 ```
+
+## License
+
+MIT

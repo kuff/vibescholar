@@ -17,6 +17,9 @@ venv/
 .vscode/
 .idea/
 
+# Claude Code (machine-specific permissions and skills)
+.claude/
+
 # Test papers (large PDFs)
 tests/test_papers/
 
@@ -24,6 +27,11 @@ tests/test_papers/
 *.faiss
 *.npy
 *.db
+*.sqlite3
+
+# Environment
+.env
+.env.*
 
 # Singularity
 *.sif
@@ -34,3 +42,6 @@ Thumbs.db
 
 # Machine-specific startup script (contains local paths)
 start-mcp-service.bat
+
+# Research agent scratchspace
+.research/
