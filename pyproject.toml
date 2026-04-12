@@ -4,9 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibescholar-mcp"
-version = "0.1.0"
-description = "MCP server exposing a VibeScholar PDF corpus to Claude Code"
+version = "0.2.0"
+description = "Academic paper search MCP server — Google Scholar + Semantic Scholar enrichment, citation tracking, and local PDF corpus indexing"
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
+authors = [{name = "Peter Guld Leth"}]
+keywords = ["mcp", "academic", "scholar", "papers", "search", "semantic-scholar"]
 dependencies = [
     "mcp[cli]>=1.0.0",
     "faiss-cpu>=1.8.0",

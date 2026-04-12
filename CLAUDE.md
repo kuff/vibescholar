@@ -25,7 +25,7 @@ Semantic Scholar API for discovery â†’ PDF resolution cascade (S2 Open Access â†
 
 | What | Where |
 |------|-------|
-| Local MCP tools (search_papers, read_document, list_indexed) | `server.py` |
+| Local MCP tools (search_local, read_document, list_indexed, index_papers) | `server.py` |
 | Online MCP tools (search_online, fetch_paper, save_paper) | `server.py` |
 | S2/Unpaywall clients, PDF cascade, in-memory extraction | `vibescholar/online.py` |
 | FTS5 query parser (AND/OR/NOT/"phrases"/prefix*) | `vibescholar/search.py:_fts5_query()` |

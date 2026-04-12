@@ -175,11 +175,12 @@ class TestToWslPath:
 
 
 class TestResolvePath:
-    def test_existing_file(self, mock_backend, tmp_path):
+    def test_arbitrary_path_rejected(self, mock_backend, tmp_path):
+        """Arbitrary filesystem paths outside the corpus are rejected."""
         real_file = tmp_path / "real.pdf"
         real_file.write_bytes(b"%PDF-1.4")
-        result = mock_backend.resolve_path(str(real_file))
-        assert result == real_file
+        with pytest.raises(FileNotFoundError, match="File not found in corpus"):
+            mock_backend.resolve_path(str(real_file))
 
     def test_file_map_by_name(self, mock_backend):
         result = mock_backend.resolve_path("attention.pdf")
@@ -194,79 +195,79 @@ class TestResolvePath:
             mock_backend.resolve_path("nonexistent_paper.pdf")
 
 
-# ── TestSearchPapers ──────────────────────────────────────────────
+# ── TestSearchLocal ───────────────────────────────────────────────
 
 
-class TestSearchPapers:
+class TestSearchLocal:
     def test_basic_returns_formatted(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [
             _make_search_result()
         ]
-        result = search_papers("attention")
+        result = search_local("attention")
         assert "Found 1 passages across 1 documents" in result
         assert "attention.pdf" in result
         assert "score=0.850" in result
 
     def test_cache_hit(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [_make_search_result()]
-        search_papers("attention")
-        search_papers("attention")
+        search_local("attention")
+        search_local("attention")
         assert mock_backend.search_service.search.call_count == 1
 
     def test_cache_key_includes_detail(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [_make_search_result()]
-        search_papers("attention", detail="brief")
-        search_papers("attention", detail="detailed")
+        search_local("attention", detail="brief")
+        search_local("attention", detail="detailed")
         assert mock_backend.search_service.search.call_count == 2
 
     def test_brief_omits_snippets(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [
             _make_search_result(snippet="this snippet should not appear in brief mode")
         ]
-        result = search_papers("attention", detail="brief")
+        result = search_local("attention", detail="brief")
         assert "this snippet should not appear" not in result
         # But filename and score are still present
         assert "attention.pdf" in result
         assert "score=" in result
 
     def test_detailed_includes_snippets(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [
             _make_search_result(snippet="attention mechanism is powerful")
         ]
-        result = search_papers("attention", detail="detailed")
+        result = search_local("attention", detail="detailed")
         assert "attention mechanism is powerful" in result
 
     def test_directory_filter_no_match(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
-        result = search_papers("attention", directory="ICLR")
+        result = search_local("attention", directory="ICLR")
         assert "No indexed directory matches" in result
         mock_backend.search_service.search.assert_not_called()
 
     def test_directory_filter_match(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = [_make_search_result()]
-        search_papers("attention", directory="CVPR")
+        search_local("attention", directory="CVPR")
         call_kwargs = mock_backend.search_service.search.call_args
         dir_ids = call_kwargs.kwargs.get("directory_ids") or call_kwargs[1].get("directory_ids")
         assert mock_backend._dir1_id in dir_ids
 
     def test_no_results(self, mock_backend):
-        from server import search_papers
+        from server import search_local
 
         mock_backend.search_service.search.return_value = []
-        result = search_papers("xyznonexistent")
+        result = search_local("xyznonexistent")
         assert "No results found" in result
 
 
@@ -381,6 +382,11 @@ class TestListIndexed:
 # ── TestSearchOnline ──────────────────────────────────────────────
 
 
+async def _passthrough_enrich(papers):
+    """Enrich stub: return papers unchanged (no S2 API calls)."""
+    return papers
+
+
 class TestSearchOnline:
     @pytest.mark.asyncio
     async def test_basic_formatted(self, monkeypatch):
@@ -388,11 +394,11 @@ class TestSearchOnline:
 
         papers = [_make_paper_result(), _make_paper_result(paper_id="def456", title="Paper Two")]
 
-        async def mock_search(query, limit):
+        async def mock_search(query, limit, **kwargs):
             return papers
 
-        monkeypatch.setattr("server.search_google_scholar", mock_search, raising=False)
-        with patch("vibescholar.online.search_google_scholar", mock_search):
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
             result = await server.search_online("attention", limit=10)
 
         assert "Found 2 papers" in result
@@ -406,11 +412,12 @@ class TestSearchOnline:
         call_count = {"n": 0}
         papers = [_make_paper_result()]
 
-        async def mock_search(query, limit):
+        async def mock_search(query, limit, **kwargs):
             call_count["n"] += 1
             return papers
 
-        with patch("vibescholar.online.search_google_scholar", mock_search):
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
             await server.search_online("attention", limit=10)
             await server.search_online("attention", limit=10)
 
@@ -422,10 +429,11 @@ class TestSearchOnline:
 
         papers = [_make_paper_result(abstract="This detailed abstract should not appear")]
 
-        async def mock_search(query, limit):
+        async def mock_search(query, limit, **kwargs):
             return papers
 
-        with patch("vibescholar.online.search_google_scholar", mock_search):
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
             result = await server.search_online("test", detail="brief")
 
         assert "This detailed abstract" not in result
@@ -437,10 +445,11 @@ class TestSearchOnline:
 
         papers = [_make_paper_result(paper_id="cached123")]
 
-        async def mock_search(query, limit):
+        async def mock_search(query, limit, **kwargs):
             return papers
 
-        with patch("vibescholar.online.search_google_scholar", mock_search):
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
             await server.search_online("test")
 
         assert "cached123" in server._paper_cache
@@ -449,13 +458,106 @@ class TestSearchOnline:
     async def test_empty_results(self, monkeypatch):
         import server
 
-        async def mock_search(query, limit):
+        async def mock_search(query, limit, **kwargs):
             return []
 
-        with patch("vibescholar.online.search_google_scholar", mock_search):
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
             result = await server.search_online("xyznonexistent")
 
         assert "No results found" in result
+
+    @pytest.mark.asyncio
+    async def test_enrichment_called_and_stable_id_cached(self, monkeypatch):
+        """enrich_with_s2 is called; enriched stable S2 IDs land in _paper_cache."""
+        import server
+
+        scholar_paper = _make_paper_result(paper_id="gs_0", title="Attention Is All You Need")
+        enriched_paper = _make_paper_result(paper_id="s2stable123", title="Attention Is All You Need")
+
+        async def mock_search(query, limit, **kwargs):
+            return [scholar_paper]
+
+        async def mock_enrich(papers):
+            return [enriched_paper]
+
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", mock_enrich):
+            await server.search_online("attention")
+
+        assert "s2stable123" in server._paper_cache
+        assert "gs_0" not in server._paper_cache
+
+    @pytest.mark.asyncio
+    async def test_year_range_passed_through(self, monkeypatch):
+        import server
+
+        captured_kwargs: dict = {}
+        papers = [_make_paper_result()]
+
+        async def mock_search(query, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return papers
+
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
+            await server.search_online("test", year_min=2020, year_max=2024)
+
+        assert captured_kwargs["year_min"] == 2020
+        assert captured_kwargs["year_max"] == 2024
+
+    @pytest.mark.asyncio
+    async def test_sort_date_passed_through(self, monkeypatch):
+        import server
+
+        captured_kwargs: dict = {}
+        papers = [_make_paper_result()]
+
+        async def mock_search(query, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return papers
+
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
+            await server.search_online("test", sort="date")
+
+        assert captured_kwargs["sort_by_date"] is True
+
+    @pytest.mark.asyncio
+    async def test_offset_passed_through(self, monkeypatch):
+        import server
+
+        captured_kwargs: dict = {}
+        papers = [_make_paper_result()]
+
+        async def mock_search(query, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return papers
+
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
+            await server.search_online("test", offset=20)
+
+        assert captured_kwargs["offset"] == 20
+
+    @pytest.mark.asyncio
+    async def test_cache_key_includes_new_params(self, monkeypatch):
+        """Different year/sort/offset produce separate cache entries."""
+        import server
+
+        call_count = {"n": 0}
+        papers = [_make_paper_result()]
+
+        async def mock_search(query, limit, **kwargs):
+            call_count["n"] += 1
+            return papers
+
+        with patch("vibescholar.online.search_google_scholar", mock_search), \
+             patch("vibescholar.online.enrich_with_s2", _passthrough_enrich):
+            await server.search_online("test", year_min=2020)
+            await server.search_online("test", year_min=2022)
+
+        assert call_count["n"] == 2
 
 
 # ── TestFetchPaper ────────────────────────────────────────────────
@@ -690,3 +792,107 @@ class TestSavePaper:
         assert '/' not in filename
         assert '<' not in filename
         assert '>' not in filename
+
+
+# ── TestIndexPapers ───────────────────────────────────────────────
+
+
+def _make_index_stats(**overrides):
+    from vibescholar.indexer import IndexStats
+    defaults = dict(
+        scanned_files=5, indexed_files=3, skipped_files=2,
+        removed_files=0, chunks_added=42, errors=0,
+    )
+    defaults.update(overrides)
+    return IndexStats(**defaults)
+
+
+class TestIndexPapers:
+    @pytest.fixture(autouse=True)
+    def _attach_indexer(self, mock_backend):
+        """Add a mock indexer and _build_file_map to the fake backend."""
+        mock_backend.indexer = MagicMock()
+        mock_backend.indexer.index_directory.return_value = _make_index_stats()
+        mock_backend._build_file_map = lambda: mock_backend._file_map
+
+    @pytest.mark.asyncio
+    async def test_folder_not_exist(self, mock_backend, tmp_path):
+        import server
+
+        result = await server.index_papers(str(tmp_path / "nonexistent"))
+        assert "Folder does not exist" in result
+
+    @pytest.mark.asyncio
+    async def test_folder_is_file(self, mock_backend, tmp_path):
+        import server
+
+        a_file = tmp_path / "file.pdf"
+        a_file.write_bytes(b"%PDF-1.4")
+        result = await server.index_papers(str(a_file))
+        assert "Not a directory" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_indexing_summary(self, mock_backend, tmp_path):
+        import server
+
+        folder = tmp_path / "papers"
+        folder.mkdir()
+        result = await server.index_papers(str(folder))
+
+        assert "Files scanned:  5" in result
+        assert "Files indexed:  3" in result
+        assert "Files skipped:  2" in result
+        assert "Chunks added:   42" in result
+        assert "Time elapsed:" in result
+
+    @pytest.mark.asyncio
+    async def test_search_cache_invalidated(self, mock_backend, tmp_path):
+        import server
+
+        server._search_cache[("test", 10, "", "detailed")] = "stale cached result"
+        folder = tmp_path / "papers"
+        folder.mkdir()
+        await server.index_papers(str(folder))
+        assert len(server._search_cache) == 0
+
+    @pytest.mark.asyncio
+    async def test_force_flag_passed_through(self, mock_backend, tmp_path):
+        import server
+
+        folder = tmp_path / "papers"
+        folder.mkdir()
+        await server.index_papers(str(folder), force=True)
+
+        call_kwargs = mock_backend.indexer.index_directory.call_args
+        assert call_kwargs.kwargs.get("force") is True
+
+    @pytest.mark.asyncio
+    async def test_indexer_exception_returns_error_string(self, mock_backend, tmp_path):
+        import server
+
+        mock_backend.indexer.index_directory.side_effect = RuntimeError("disk full")
+        folder = tmp_path / "papers"
+        folder.mkdir()
+        result = await server.index_papers(str(folder))
+        assert "Indexing failed" in result
+        assert "disk full" in result
+
+    @pytest.mark.asyncio
+    async def test_upsert_directory_called(self, mock_backend, tmp_path):
+        """DB upsert_directory is called with the resolved folder path."""
+        import server
+
+        folder = tmp_path / "papers"
+        folder.mkdir()
+
+        upserted: list[str] = []
+        original_upsert = mock_backend.db.upsert_directory
+
+        def recording_upsert(path):
+            upserted.append(path)
+            return original_upsert(path)
+
+        mock_backend.db.upsert_directory = recording_upsert
+        await server.index_papers(str(folder))
+        assert len(upserted) == 1
+        assert str(folder) in upserted[0]

@@ -17,8 +17,10 @@ from vibescholar.online import (
     _parse_paper,
     _resolve_pdf_sources,
     _s2_headers,
+    _title_similarity,
     _try_download_pdf,
     _unpaywall_pdf_url,
+    enrich_with_s2,
     fetch_paper_pdf_text,
     get_paper_metadata,
     search_semantic_scholar,
@@ -512,3 +514,246 @@ class TestConfigHelpers:
     def test_email_custom(self, monkeypatch):
         monkeypatch.setenv("VIBESCHOLAR_EMAIL", "me@example.com")
         assert _email() == "me@example.com"
+
+
+# ── TestTitleSimilarity ───────────────────────────────────────────
+
+
+class TestTitleSimilarity:
+    def test_identical(self):
+        assert _title_similarity("Attention Is All You Need", "Attention Is All You Need") == 1.0
+
+    def test_case_insensitive(self):
+        assert _title_similarity("Attention Is All You Need", "attention is all you need") == 1.0
+
+    def test_punctuation_stripped(self):
+        assert _title_similarity("Foo: A Survey", "Foo A Survey") > 0.85
+
+    def test_high_similarity(self):
+        assert _title_similarity("Attention Is All You Need", "Attention is All You Need!") >= 0.85
+
+    def test_below_threshold(self):
+        assert _title_similarity("Neural Style Transfer", "Generative Adversarial Networks") < 0.85
+
+    def test_completely_different(self):
+        assert _title_similarity("BERT Pre-training", "ResNet Deep Residual Learning") < 0.85
+
+    def test_empty_first(self):
+        assert _title_similarity("", "Some Title") == 0.0
+
+    def test_empty_second(self):
+        assert _title_similarity("Some Title", "") == 0.0
+
+    def test_single_char_tokens_dropped(self):
+        # "a" and "b" are length-1 and dropped; effective tokens may differ
+        result = _title_similarity("Transformer", "Transformer")
+        assert result == 1.0
+
+
+# ── TestEnrichWithS2 ──────────────────────────────────────────────
+
+
+def _make_gs_paper(**overrides) -> PaperResult:
+    """Make a Scholar-style PaperResult with a gs_* ID."""
+    defaults = dict(
+        paper_id="gs_0",
+        title="Attention Is All You Need",
+        authors=["A Vaswani"],
+        year=2017,
+        venue="NeurIPS",
+        citation_count=50000,
+        abstract="Short snippet from Scholar.",
+        doi=None,
+        arxiv_id=None,
+        open_access_url="https://arxiv.org/pdf/1706.03762",
+        external_ids={},
+    )
+    defaults.update(overrides)
+    return PaperResult(**defaults)
+
+
+def _s2_enrich_response(paper_dict: dict) -> httpx.Response:
+    """Build a mock S2 search response containing a single paper."""
+    body = {"total": 1, "offset": 0, "data": [paper_dict]}
+    return httpx.Response(200, json=body, request=httpx.Request("GET", "https://s2"))
+
+
+class TestEnrichWithS2:
+    @pytest.mark.asyncio
+    async def test_match_replaces_gs_id(self, monkeypatch):
+        """Matched Scholar paper gets S2 stable ID, full abstract, DOI."""
+        s2_data = _s2_paper_dict()  # title: "Attention Is All You Need"
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        papers = await enrich_with_s2([_make_gs_paper()])
+        assert len(papers) == 1
+        assert papers[0].paper_id == "abc123def"
+        assert papers[0].doi == "10.48550/arXiv.1706.03762"
+        assert papers[0].arxiv_id == "1706.03762"
+        assert "sequence transduction" in papers[0].abstract
+
+    @pytest.mark.asyncio
+    async def test_no_match_preserves_gs_paper(self, monkeypatch):
+        """Low title similarity keeps gs_* ID unchanged."""
+        s2_data = _s2_paper_dict(title="Deep Residual Learning for Image Recognition")
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        original = _make_gs_paper()
+        papers = await enrich_with_s2([original])
+        assert papers[0].paper_id == "gs_0"
+        assert papers[0].abstract == "Short snippet from Scholar."
+
+    @pytest.mark.asyncio
+    async def test_s2_failure_preserves_gs_paper(self, monkeypatch):
+        """S2 returning None leaves the original paper untouched."""
+        async def mock_get(self, url, **kwargs):
+            return httpx.Response(500, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        original = _make_gs_paper()
+        papers = await enrich_with_s2([original])
+        assert papers[0].paper_id == "gs_0"
+
+    @pytest.mark.asyncio
+    async def test_scholar_pdf_promoted_when_s2_has_no_oa(self, monkeypatch):
+        """Scholar's PDF becomes open_access_url when S2 has no OA URL."""
+        s2_data = _s2_paper_dict(openAccessPdf=None)
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        gs = _make_gs_paper(open_access_url="https://arxiv.org/pdf/1706.03762")
+        papers = await enrich_with_s2([gs])
+        assert papers[0].open_access_url == "https://arxiv.org/pdf/1706.03762"
+        assert "scholar_pdf_url" not in papers[0].external_ids
+
+    @pytest.mark.asyncio
+    async def test_scholar_pdf_stashed_when_s2_has_oa(self, monkeypatch):
+        """Scholar's PDF URL is stashed in external_ids when S2 has its own OA URL."""
+        s2_data = _s2_paper_dict()  # has openAccessPdf
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        scholar_pdf = "https://arxiv.org/pdf/1706.03762"
+        gs = _make_gs_paper(open_access_url=scholar_pdf)
+        papers = await enrich_with_s2([gs])
+        # S2's OA URL takes primary slot
+        assert papers[0].open_access_url == "https://example.com/paper.pdf"
+        # Scholar's URL preserved as fallback
+        assert papers[0].external_ids.get("scholar_pdf_url") == scholar_pdf
+
+    @pytest.mark.asyncio
+    async def test_same_urls_not_duplicated(self, monkeypatch):
+        """No scholar_pdf_url stashed when both URLs are identical."""
+        same_url = "https://example.com/paper.pdf"
+        s2_data = _s2_paper_dict(openAccessPdf={"url": same_url})
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        gs = _make_gs_paper(open_access_url=same_url)
+        papers = await enrich_with_s2([gs])
+        assert papers[0].open_access_url == same_url
+        assert "scholar_pdf_url" not in papers[0].external_ids
+
+    @pytest.mark.asyncio
+    async def test_empty_input(self, monkeypatch):
+        papers = await enrich_with_s2([])
+        assert papers == []
+
+    @pytest.mark.asyncio
+    async def test_scholar_navigation_urls_preserved(self, monkeypatch):
+        """cited_by_url and related_url survive enrichment into external_ids."""
+        s2_data = _s2_paper_dict()
+
+        async def mock_get(self, url, **kwargs):
+            return _s2_enrich_response(s2_data)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        gs = _make_gs_paper(
+            open_access_url=None,
+            external_ids={
+                "cited_by_url": "/scholar?cites=12345&hl=en",
+                "related_url": "/scholar?q=related:abcde:scholar.google.com/&hl=en",
+            },
+        )
+        papers = await enrich_with_s2([gs])
+        assert papers[0].external_ids.get("cited_by_url") == "/scholar?cites=12345&hl=en"
+        assert "related:" in papers[0].external_ids.get("related_url", "")
+        # S2 external IDs are also present
+        assert "DOI" in papers[0].external_ids
+
+    @pytest.mark.asyncio
+    async def test_partial_match(self, monkeypatch):
+        """Mixed batch: matched paper gets S2 ID, unmatched keeps gs_*."""
+        call_count = {"n": 0}
+
+        async def mock_get(self, url, **kwargs):
+            call_count["n"] += 1
+            # First call matches, second call returns a different title
+            if call_count["n"] == 1:
+                return _s2_enrich_response(_s2_paper_dict())
+            return _s2_enrich_response(
+                _s2_paper_dict(paperId="other", title="Completely Different Paper Title Here")
+            )
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", mock_get)
+        gs0 = _make_gs_paper(paper_id="gs_0")
+        gs1 = _make_gs_paper(paper_id="gs_1", title="Something Else Entirely Unrelated Work")
+        papers = await enrich_with_s2([gs0, gs1])
+        assert papers[0].paper_id == "abc123def"  # matched
+        assert papers[1].paper_id == "gs_1"        # unmatched
+
+
+# ── TestPdfResolutionCascadeScholar ───────────────────────────────
+
+
+class TestPdfResolutionCascadeScholar:
+    """Additional _resolve_pdf_sources tests for the scholar_pdf_url field."""
+
+    def test_scholar_pdf_url_in_external_ids(self):
+        paper = _make_paper(
+            open_access_url=None,
+            doi=None,
+            arxiv_id=None,
+            external_ids={"scholar_pdf_url": "https://scholar.example.com/paper.pdf"},
+        )
+        sources = _resolve_pdf_sources(paper)
+        names = [n for n, _ in sources]
+        assert "Scholar PDF" in names
+
+    def test_scholar_pdf_not_duplicated_when_promoted(self):
+        """If scholar_pdf_url equals open_access_url, it is not added twice."""
+        url = "https://example.com/paper.pdf"
+        paper = _make_paper(
+            open_access_url=url,
+            doi=None,
+            arxiv_id=None,
+            external_ids={"scholar_pdf_url": url},
+        )
+        sources = _resolve_pdf_sources(paper)
+        urls = [u for _, u in sources]
+        assert urls.count(url) == 1
+
+    def test_scholar_pdf_ordering(self):
+        """Scholar PDF appears after S2 OA, ArXiv, Unpaywall, Publisher direct."""
+        paper = _make_paper(
+            external_ids={
+                "DOI": "10.1234/test",
+                "ArXiv": "2401.12345",
+                "scholar_pdf_url": "https://scholar.example.com/paper.pdf",
+            },
+        )
+        sources = _resolve_pdf_sources(paper)
+        names = [n for n, _ in sources]
+        assert names[-1] == "Scholar PDF"

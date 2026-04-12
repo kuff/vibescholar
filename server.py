@@ -1,14 +1,16 @@
 """VibeScholar MCP Server
 
-Gives Claude access to two tiers of academic literature:
+Gives Claude access to academic literature via two tiers:
 
-1. **Curated local corpus** — a vetted collection of top-tier venue papers
-   (CVPR, NeurIPS, ICML, etc.) indexed for fast hybrid search.  Always
-   searched first.
+1. **Online** (primary) — Google Scholar search with transparent Semantic
+   Scholar enrichment, citation tracking, author profiles, and on-demand
+   PDF retrieval.  Use for any research question; results carry stable S2
+   identifiers that remain accessible across sessions.
 
-2. **Online (supplementary)** — Google Scholar search, citation tracking,
-   author profiles, and on-demand PDF retrieval for context beyond the
-   corpus.  Papers fetched online are NOT added to the local index.
+2. **Local corpus** (secondary) — a personally-indexed collection of PDFs
+   with fast hybrid semantic + keyword search.  Use when you have a local
+   library indexed via index_papers, or when explicitly instructed to search
+   it.
 
 Environment variables
 ---------------------
@@ -67,6 +69,7 @@ class _Backend:
         self._embedder = None
         self._store = None
         self._search_service = None
+        self._indexer = None
 
     def _ensure_search_stack(self) -> None:
         """Load the embedding model, FAISS index, and search service (once)."""
@@ -76,11 +79,13 @@ class _Backend:
         from vibescholar.embeddings import Embedder
         from vibescholar.vectors import FaissStore
         from vibescholar.search import SearchService
+        from vibescholar.indexer import PdfIndexer
 
         logger.info("Loading embedding model...")
         self._embedder = Embedder()
         self._store = FaissStore(self._config.FAISS_INDEX_PATH, self._embedder.dimension)
         self._search_service = SearchService(self.db, self._embedder, self._store)
+        self._indexer = PdfIndexer(self.db, self._embedder, self._store)
         logger.info("Search stack ready (%d vectors)", self._store.ntotal)
 
     @property
@@ -97,6 +102,11 @@ class _Backend:
     def search_service(self):
         self._ensure_search_stack()
         return self._search_service
+
+    @property
+    def indexer(self):
+        self._ensure_search_stack()
+        return self._indexer
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -122,11 +132,12 @@ class _Backend:
         return Path(path_str)
 
     def resolve_path(self, file_path: str) -> Path:
-        """Resolve *file_path* to an existing PDF, accepting full paths, filenames,
-        or stems (without extension)."""
-        p = self._to_wsl_path(file_path)
-        if p.exists():
-            return p
+        """Resolve *file_path* to an existing PDF in the indexed corpus.
+
+        Accepts filenames (e.g. ``"paper.pdf"``), stems (``"paper"``), or full
+        paths that match an indexed file.  Only files registered in the corpus
+        are returned — arbitrary filesystem paths are rejected.
+        """
         wp = PureWindowsPath(file_path)
         hit = self._file_map.get(wp.name.lower()) or self._file_map.get(
             wp.stem.lower()
@@ -153,172 +164,9 @@ def _clean(text: str) -> str:
     return clean_text(text)
 
 
-# ── Query cache ──────────────────────────────────────────────────────
-_search_cache: OrderedDict[tuple[str, int, str, str], str] = OrderedDict()
-_SEARCH_CACHE_MAX = 32
+# ── Online search caches ──────────────────────────────────────────────
 
-
-# ── Tools ───────────────────────────────────────────────────────────
-
-
-@mcp.tool()
-def search_papers(
-    query: str,
-    top_k: int = 10,
-    directory: str = "",
-    detail: str = "detailed",
-) -> str:
-    """Search the curated local corpus of vetted, top-tier venue papers.
-
-    This is the primary search tool.  The corpus contains hand-selected work
-    from top venues (CVPR, NeurIPS, ICML, etc.) and should be searched first
-    for any question about topics it covers.  Uses hybrid semantic + keyword
-    retrieval with cross-encoder reranking for high-quality results.
-
-    Use read_document on promising hits to get full page text.
-
-    Query syntax (FTS5 operators — combine freely):
-      - Natural language: "optimal transport for domain adaptation"
-      - AND: "transformer AND attention" (both terms required)
-      - OR: "GAN OR diffusion" (either term)
-      - NOT: "segmentation NOT medical" (exclude term)
-      - "quoted phrase": '"optimal transport"' (exact phrase match)
-      - prefix*: "optim*" (matches optimize, optimization, optimal, etc.)
-      - Combined: '"optimal transport" AND generative NOT video'
-
-    Args:
-        query: Natural language or structured query using operators above.
-        top_k: Maximum hits to return (default 10).
-        directory: Filter to a specific directory by name substring (e.g. "CVPR").
-                   Omit to search the entire corpus.
-        detail: "brief" for titles and scores only, "detailed" (default) includes
-                text snippets. Use brief to scan many results without filling context.
-    """
-    cache_key = (query, top_k, directory, detail)
-    if cache_key in _search_cache:
-        _search_cache.move_to_end(cache_key)
-        return _search_cache[cache_key]
-
-    backend = _get_backend()
-
-    dir_filter: set[int] | None = None
-    if directory:
-        all_dirs = backend.db.list_directories()
-        dir_filter = {
-            int(d["id"]) for d in all_dirs
-            if directory.lower() in str(d["path"]).lower()
-        }
-        if not dir_filter:
-            return f"No indexed directory matches '{directory}'. Use list_indexed to see available directories."
-
-    results = backend.search_service.search(
-        query=query, top_k=top_k, active_only=True, directory_ids=dir_filter
-    )
-    if not results:
-        return "No results found in the corpus for this query."
-
-    brief = detail == "brief"
-    parts: list[str] = []
-    for fr in results:
-        name = PureWindowsPath(fr.file_path).name
-        for hit in fr.hits:
-            if brief:
-                parts.append(
-                    f"[{name}  p.{hit.page_number}  score={hit.score:.3f}]"
-                    f"  path: {fr.file_path}"
-                )
-            else:
-                parts.append(
-                    f"[{name}  p.{hit.page_number}  score={hit.score:.3f}]\n"
-                    f"  path: {fr.file_path}\n"
-                    f"  {_clean(hit.snippet)}"
-                )
-    total_hits = sum(len(fr.hits) for fr in results)
-    result = f"Found {total_hits} passages across {len(results)} documents.\n\n" + "\n\n".join(parts)
-
-    _search_cache[cache_key] = result
-    if len(_search_cache) > _SEARCH_CACHE_MAX:
-        _search_cache.popitem(last=False)
-
-    return result
-
-
-@mcp.tool()
-def read_document(file_path: str, pages: list[int] | None = None) -> str:
-    """Read full text from a paper in the curated local corpus.
-
-    Accepts full path, filename, or stem.  Use after search_papers to read
-    full page content of relevant hits from the vetted collection.
-
-    Args:
-        file_path: Path, filename (e.g. "paper.pdf"), or stem (e.g. "paper").
-        pages: 1-based page numbers to read. Omit to read all pages.
-    """
-    from pypdf import PdfReader
-
-    backend = _get_backend()
-    resolved = backend.resolve_path(file_path)
-
-    reader = PdfReader(str(resolved))
-    total = len(reader.pages)
-
-    indices = (
-        [p - 1 for p in pages if 1 <= p <= total] if pages else list(range(total))
-    )
-
-    texts: list[str] = []
-    for idx in indices:
-        raw = reader.pages[idx].extract_text() or ""
-        cleaned = _clean(raw)
-        if cleaned:
-            texts.append(f"--- Page {idx + 1} ---\n{cleaned}")
-
-    if not texts:
-        return "No text could be extracted from the requested pages."
-
-    header = f"Document: {resolved.name} ({total} pages total)\n\n"
-    return header + "\n\n".join(texts)
-
-
-@mcp.tool()
-def list_indexed() -> str:
-    """List all directories and papers in the curated local corpus.
-
-    Shows indexed directories, file counts, chunk counts, and status.
-    Use to discover what vetted material is available before searching.
-    """
-    backend = _get_backend()
-    dirs = backend.db.list_directories()
-
-    if not dirs:
-        return "The corpus is empty — no directories have been indexed yet."
-
-    parts: list[str] = []
-    for d in dirs:
-        status = "active" if d["active"] else "inactive"
-        files = backend.db.get_files_for_directory(int(d["id"]))
-        file_names = sorted(PureWindowsPath(f["path"]).name for f in files)
-
-        section = (
-            f"Directory: {d['path']}\n"
-            f"  Status: {status} | Files: {d['file_count']} "
-            f"| Chunks: {d['chunk_count']}\n"
-            f"  Last indexed: {d['last_indexed_at'] or 'never'}"
-        )
-        if file_names:
-            listing = "\n".join(f"    - {n}" for n in file_names)
-            section += f"\n  Documents:\n{listing}"
-        parts.append(section)
-
-    total_chunks = backend.db.total_chunk_count()
-    parts.append(f"Totals: {total_chunks} chunks")
-
-    return "\n\n".join(parts)
-
-
-# ── Online search caches ───────────────────────────────────────────
-
-_online_search_cache: OrderedDict[tuple[str, int, str], str] = OrderedDict()
+_online_search_cache: OrderedDict[tuple, str] = OrderedDict()
 _ONLINE_SEARCH_CACHE_MAX = 32
 
 # paper_id -> PaperResult  (avoids re-fetching between search_online and fetch_paper)
@@ -343,9 +191,6 @@ def _format_authors(authors: list[str], brief: bool = False) -> str:
     if len(authors) > 6:
         return "; ".join(authors[:6]) + " et al."
     return "; ".join(authors)
-
-
-# ── Online tools ───────────────────────────────────────────────────
 
 
 def _format_online_results(
@@ -386,19 +231,25 @@ def _format_online_results(
     return f"Found {len(papers)} {heading}.\n\n" + "\n\n".join(parts)
 
 
+# ── Online tools ────────────────────────────────────────────────────
+
+
 @mcp.tool()
 async def search_online(
     query: str,
     limit: int = 10,
     detail: str = "detailed",
+    year_min: int | None = None,
+    year_max: int | None = None,
+    sort: str = "relevance",
+    offset: int = 0,
 ) -> str:
-    """Search Google Scholar for papers beyond the curated local corpus.
+    """Search Google Scholar for academic papers on any topic.
 
-    Use when the local corpus (search_papers) does not cover the topic, or
-    when you need supplementary context, background, or recent work not yet
-    in the vetted collection.  Returns metadata and snippets for discovery.
-
-    Use fetch_paper on interesting results to retrieve and read the full text.
+    This is the primary search tool for literature discovery.  Results are
+    transparently enriched with Semantic Scholar metadata — stable IDs, full
+    abstracts, DOIs, and ArXiv links — so they remain accessible across
+    sessions.  Use fetch_paper on any result to retrieve and read the full text.
 
     Query syntax (Google Scholar operators — combine freely):
       - Natural language: "optimal transport for generative models"
@@ -409,24 +260,41 @@ async def search_online(
       - Author: "author:hinton" (filter by author name)
       - Source: "source:NeurIPS" (filter by venue/journal)
       - Combined: '"optimal transport" author:cuturi -survey'
-      - Year filtering is not supported via query syntax; use Scholar's UI.
 
     Args:
         query: Natural language or structured query using operators above.
-        limit: Maximum number of results (default 10, max 20).
+        limit: Maximum number of results per page (default 10, max 20).
         detail: "brief" for titles/authors/year only, "detailed" (default)
-                includes snippets and PDF links.
+                includes abstracts and PDF links.
+        year_min: Only include papers published in this year or later.
+        year_max: Only include papers published in this year or earlier.
+        sort: "relevance" (default) or "date" to sort by publication date.
+        offset: 0-based result offset for pagination. Pass 20 to get
+                results 21-40, etc.
     """
-    cache_key = (query, limit, detail)
+    if not query or not query.strip():
+        return "Query cannot be empty."
+    limit = max(1, min(limit, 20))
+    offset = max(0, offset)
+
+    cache_key = (query, limit, detail, year_min, year_max, sort, offset)
     if cache_key in _online_search_cache:
         _online_search_cache.move_to_end(cache_key)
         return _online_search_cache[cache_key]
 
-    from vibescholar.online import search_google_scholar
+    from vibescholar.online import search_google_scholar, enrich_with_s2
 
-    papers = await search_google_scholar(query, limit)
+    papers = await search_google_scholar(
+        query, limit,
+        year_min=year_min,
+        year_max=year_max,
+        sort_by_date=(sort == "date"),
+        offset=offset,
+    )
     if not papers:
         return f"No results found on Google Scholar for: {query}"
+
+    papers = await enrich_with_s2(papers)
 
     for p in papers:
         _cache_paper(p)
@@ -445,12 +313,12 @@ async def fetch_paper(paper_id: str, pages: list[int] | None = None) -> str:
     """Retrieve and read the full text of a paper found via online search.
 
     Use after search_online, cited_by_online, related_papers_online, or
-    author_papers_online to get the actual content of a paper that is not
-    in the local corpus.  Accepts Semantic Scholar IDs, DOIs (DOI:xxx), or
-    ArXiv IDs (ArXiv:xxx).  Tries multiple sources to find an accessible PDF.
+    author_papers_online to get the actual content of a paper.  Accepts
+    Semantic Scholar IDs, DOIs (DOI:xxx), or ArXiv IDs (ArXiv:xxx).  Tries
+    multiple sources to find an accessible PDF.
 
     The PDF is processed in memory and returned as context — it is NOT
-    added to the curated local corpus.
+    added to the local corpus.
 
     Args:
         paper_id: Paper identifier, e.g. "abc123def", "DOI:10.1234/example",
@@ -502,22 +370,36 @@ async def fetch_paper(paper_id: str, pages: list[int] | None = None) -> str:
 
 
 @mcp.tool()
-async def cited_by_online(title: str, limit: int = 10, detail: str = "detailed") -> str:
+async def cited_by_online(
+    title: str, limit: int = 10, detail: str = "detailed", paper_id: str = "",
+) -> str:
     """Find papers that cite a given work, via Google Scholar.
 
     Use to trace the impact of a paper or find follow-up work that builds
-    on it.  Works for both papers in the local corpus and any other paper —
-    just provide the title.
+    on it.  Works for any paper — just provide the title.
+
+    If paper_id is provided and the paper was found via a prior search_online
+    call, the "Cited by" link is followed directly without an extra Scholar
+    lookup (faster and more reliable).
 
     Args:
         title: Title (or distinctive phrase) of the paper to find citations for.
         limit: Maximum number of citing papers to return (default 10, max 20).
         detail: "brief" for titles/authors/year only, "detailed" (default)
                 includes snippets and PDF links.
+        paper_id: Optional paper ID from a prior search_online result. If set,
+                  skips the initial title search by reusing the cached "Cited by"
+                  URL.
     """
     from vibescholar.online import cited_by
 
-    papers = await cited_by(title, limit)
+    direct_url: str | None = None
+    if paper_id:
+        cached = _paper_cache.get(paper_id)
+        if cached:
+            direct_url = cached.external_ids.get("cited_by_url")
+
+    papers = await cited_by(title, limit, cited_by_url=direct_url)
     if not papers:
         return f"No citing papers found for: {title}"
 
@@ -528,22 +410,36 @@ async def cited_by_online(title: str, limit: int = 10, detail: str = "detailed")
 
 
 @mcp.tool()
-async def related_papers_online(title: str, limit: int = 10, detail: str = "detailed") -> str:
+async def related_papers_online(
+    title: str, limit: int = 10, detail: str = "detailed", paper_id: str = "",
+) -> str:
     """Find papers related to a given work, via Google Scholar.
 
     Use to discover alternative approaches, concurrent work, or papers in
-    the same research area.  Works for both local corpus papers and any
-    other paper — just provide the title.
+    the same research area.  Works for any paper — just provide the title.
+
+    If paper_id is provided and the paper was found via a prior search_online
+    call, the "Related articles" link is followed directly without an extra
+    Scholar lookup (faster and more reliable).
 
     Args:
         title: Title (or distinctive phrase) of the paper.
         limit: Maximum number of related papers to return (default 10, max 20).
         detail: "brief" for titles/authors/year only, "detailed" (default)
                 includes snippets and PDF links.
+        paper_id: Optional paper ID from a prior search_online result. If set,
+                  skips the initial title search by reusing the cached "Related
+                  articles" URL.
     """
     from vibescholar.online import related_papers
 
-    papers = await related_papers(title, limit)
+    direct_url: str | None = None
+    if paper_id:
+        cached = _paper_cache.get(paper_id)
+        if cached:
+            direct_url = cached.external_ids.get("related_url")
+
+    papers = await related_papers(title, limit, related_url=direct_url)
     if not papers:
         return f"No related papers found for: {title}"
 
@@ -557,8 +453,8 @@ async def related_papers_online(title: str, limit: int = 10, detail: str = "deta
 async def author_papers_online(author: str, limit: int = 20, detail: str = "detailed") -> str:
     """Find papers by a specific author via their Google Scholar profile.
 
-    Use to explore a researcher's body of work — e.g. to find other relevant
-    papers by an author encountered in the local corpus or online results.
+    Use to explore a researcher's body of work — e.g. to find all papers by
+    an author you encountered in search results.
 
     Args:
         author: Author name to search for (e.g. "Yann LeCun").
@@ -641,6 +537,231 @@ async def save_paper(paper: str, directory: str) -> str:
     return (
         f"Saved \"{paper_meta.title}\" to: {dest}\n"
         f"Source: {source} | Size: {len(pdf_bytes):,} bytes"
+    )
+
+
+# ── Local corpus tools ───────────────────────────────────────────────
+
+# Query cache for search_local
+_search_cache: OrderedDict[tuple[str, int, str, str], str] = OrderedDict()
+_SEARCH_CACHE_MAX = 32
+
+
+@mcp.tool()
+def search_local(
+    query: str,
+    top_k: int = 10,
+    directory: str = "",
+    detail: str = "detailed",
+) -> str:
+    """Search your locally indexed PDF library.
+
+    Use when you have a personal collection of papers indexed via
+    index_papers, or when explicitly instructed to search the local corpus.
+    For general literature search, use search_online instead.
+
+    Uses hybrid semantic + keyword retrieval with cross-encoder reranking.
+    Use read_document on promising hits to get full page text.
+
+    Query syntax (FTS5 operators — combine freely):
+      - Natural language: "optimal transport for domain adaptation"
+      - AND: "transformer AND attention" (both terms required)
+      - OR: "GAN OR diffusion" (either term)
+      - NOT: "segmentation NOT medical" (exclude term)
+      - "quoted phrase": '"optimal transport"' (exact phrase match)
+      - prefix*: "optim*" (matches optimize, optimization, optimal, etc.)
+      - Combined: '"optimal transport" AND generative NOT video'
+
+    Args:
+        query: Natural language or structured query using operators above.
+        top_k: Maximum hits to return (default 10).
+        directory: Filter to a specific directory by name substring (e.g. "CVPR").
+                   Omit to search the entire corpus.
+        detail: "brief" for titles and scores only, "detailed" (default) includes
+                text snippets. Use brief to scan many results without filling context.
+    """
+    if not query or not query.strip():
+        return "Query cannot be empty."
+    top_k = max(1, min(top_k, 100))
+
+    cache_key = (query, top_k, directory, detail)
+    if cache_key in _search_cache:
+        _search_cache.move_to_end(cache_key)
+        return _search_cache[cache_key]
+
+    backend = _get_backend()
+
+    dir_filter: set[int] | None = None
+    if directory:
+        all_dirs = backend.db.list_directories()
+        dir_filter = {
+            int(d["id"]) for d in all_dirs
+            if directory.lower() in str(d["path"]).lower()
+        }
+        if not dir_filter:
+            return f"No indexed directory matches '{directory}'. Use list_indexed to see available directories."
+
+    results = backend.search_service.search(
+        query=query, top_k=top_k, active_only=True, directory_ids=dir_filter
+    )
+    if not results:
+        return "No results found in the corpus for this query."
+
+    brief = detail == "brief"
+    parts: list[str] = []
+    for fr in results:
+        name = PureWindowsPath(fr.file_path).name
+        for hit in fr.hits:
+            if brief:
+                parts.append(
+                    f"[{name}  p.{hit.page_number}  score={hit.score:.3f}]"
+                    f"  path: {fr.file_path}"
+                )
+            else:
+                parts.append(
+                    f"[{name}  p.{hit.page_number}  score={hit.score:.3f}]\n"
+                    f"  path: {fr.file_path}\n"
+                    f"  {_clean(hit.snippet)}"
+                )
+    total_hits = sum(len(fr.hits) for fr in results)
+    result = f"Found {total_hits} passages across {len(results)} documents.\n\n" + "\n\n".join(parts)
+
+    _search_cache[cache_key] = result
+    if len(_search_cache) > _SEARCH_CACHE_MAX:
+        _search_cache.popitem(last=False)
+
+    return result
+
+
+@mcp.tool()
+def read_document(file_path: str, pages: list[int] | None = None) -> str:
+    """Read full text from a paper in the local corpus.
+
+    Accepts full path, filename, or stem.  Use after search_local to read
+    full page content of a locally indexed document.
+
+    Args:
+        file_path: Path, filename (e.g. "paper.pdf"), or stem (e.g. "paper").
+        pages: 1-based page numbers to read. Omit to read all pages.
+    """
+    from pypdf import PdfReader
+
+    backend = _get_backend()
+    resolved = backend.resolve_path(file_path)
+
+    reader = PdfReader(str(resolved))
+    total = len(reader.pages)
+
+    indices = (
+        [p - 1 for p in pages if 1 <= p <= total] if pages else list(range(total))
+    )
+
+    texts: list[str] = []
+    for idx in indices:
+        raw = reader.pages[idx].extract_text() or ""
+        cleaned = _clean(raw)
+        if cleaned:
+            texts.append(f"--- Page {idx + 1} ---\n{cleaned}")
+
+    if not texts:
+        return "No text could be extracted from the requested pages."
+
+    header = f"Document: {resolved.name} ({total} pages total)\n\n"
+    return header + "\n\n".join(texts)
+
+
+@mcp.tool()
+def list_indexed() -> str:
+    """List all directories and papers in the local corpus.
+
+    Shows indexed directories, file counts, chunk counts, and status.
+    Use to see what is available to search_local, or to check what
+    index_papers has already indexed.
+    """
+    backend = _get_backend()
+    dirs = backend.db.list_directories()
+
+    if not dirs:
+        return "The local corpus is empty — use index_papers to add a folder of PDFs."
+
+    parts: list[str] = []
+    for d in dirs:
+        status = "active" if d["active"] else "inactive"
+        files = backend.db.get_files_for_directory(int(d["id"]))
+        file_names = sorted(PureWindowsPath(f["path"]).name for f in files)
+
+        section = (
+            f"Directory: {d['path']}\n"
+            f"  Status: {status} | Files: {d['file_count']} "
+            f"| Chunks: {d['chunk_count']}\n"
+            f"  Last indexed: {d['last_indexed_at'] or 'never'}"
+        )
+        if file_names:
+            listing = "\n".join(f"    - {n}" for n in file_names)
+            section += f"\n  Documents:\n{listing}"
+        parts.append(section)
+
+    total_chunks = backend.db.total_chunk_count()
+    parts.append(f"Totals: {total_chunks} chunks")
+
+    return "\n\n".join(parts)
+
+
+@mcp.tool()
+async def index_papers(folder: str, force: bool = False) -> str:
+    """Index a folder of PDFs into the local corpus.
+
+    Scans the folder for PDFs and adds them to the local indexed library,
+    making them searchable via search_local and readable via read_document.
+    Already-indexed files are skipped unless force=True.  Large folders may
+    take several minutes.
+
+    Args:
+        folder: Absolute path to the folder containing PDFs to index.
+        force: Re-index all files even if unchanged (default False).
+    """
+    import asyncio
+    import time
+
+    folder_path = _Backend._to_wsl_path(folder)
+    if not folder_path.exists():
+        return f"Folder does not exist: {folder}"
+    if not folder_path.is_dir():
+        return f"Not a directory: {folder}"
+
+    backend = _get_backend()
+    dir_id = backend.db.upsert_directory(str(folder_path))
+
+    loop = asyncio.get_event_loop()
+    t0 = time.monotonic()
+    try:
+        stats = await loop.run_in_executor(
+            None,
+            lambda: backend.indexer.index_directory(
+                directory_id=dir_id,
+                directory_path=folder_path,
+                force=force,
+            ),
+        )
+    except Exception as exc:
+        logger.error("index_papers failed: %s", exc, exc_info=True)
+        return f"Indexing failed: {exc}"
+
+    elapsed = time.monotonic() - t0
+
+    # Invalidate local search cache and rebuild path resolver
+    _search_cache.clear()
+    backend._file_map = backend._build_file_map()
+
+    return (
+        f"Indexed folder: {folder_path}\n"
+        f"  Files scanned:  {stats.scanned_files}\n"
+        f"  Files indexed:  {stats.indexed_files}\n"
+        f"  Files skipped:  {stats.skipped_files} (unchanged)\n"
+        f"  Files removed:  {stats.removed_files} (no longer present)\n"
+        f"  Chunks added:   {stats.chunks_added}\n"
+        f"  Errors:         {stats.errors}\n"
+        f"  Time elapsed:   {elapsed:.1f}s"
     )
 
 

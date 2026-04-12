@@ -304,6 +304,23 @@ class TestCitedBy:
 
         assert len(papers) <= 1
 
+    @pytest.mark.asyncio
+    async def test_direct_url_skips_search(self):
+        """Passing cited_by_url directly skips the initial title search."""
+        call_urls: list[str] = []
+
+        async def mock_fetch(url):
+            call_urls.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        direct = "/scholar?cites=12345&hl=en"
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            papers = await cited_by("Anything", cited_by_url=direct)
+
+        assert len(call_urls) == 1  # only one call, no initial search
+        assert "cites=12345" in call_urls[0]
+        assert len(papers) == 2
+
 
 # ── TestRelatedPapers (async, mocked browser) ────────────────────
 
@@ -343,6 +360,23 @@ class TestRelatedPapers:
             papers = await related_papers("nonexistent")
 
         assert papers == []
+
+    @pytest.mark.asyncio
+    async def test_direct_url_skips_search(self):
+        """Passing related_url directly skips the initial title search."""
+        call_urls: list[str] = []
+
+        async def mock_fetch(url):
+            call_urls.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        direct = "/scholar?q=related:abcde:scholar.google.com/&hl=en"
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            papers = await related_papers("Anything", related_url=direct)
+
+        assert len(call_urls) == 1  # only one call, no initial search
+        assert "related:" in call_urls[0]
+        assert len(papers) == 2
 
 
 # ── TestAuthorPapers (async, mocked browser) ──────────────────────
@@ -435,6 +469,98 @@ class TestSearchGoogleScholar:
 
         assert len(papers) == 1
 
+    @pytest.mark.asyncio
+    async def test_year_min_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", year_min=2020)
+
+        assert "as_ylo=2020" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_year_max_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", year_max=2023)
+
+        assert "as_yhi=2023" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_year_range_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", year_min=2020, year_max=2023)
+
+        assert "as_ylo=2020" in captured[0]
+        assert "as_yhi=2023" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_sort_by_date_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", sort_by_date=True)
+
+        assert "scisbd=1" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_sort_by_relevance_no_scisbd(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", sort_by_date=False)
+
+        assert "scisbd" not in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_offset_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", offset=20)
+
+        assert "start=20" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_zero_offset_not_in_url(self):
+        captured: list[str] = []
+
+        async def mock_fetch(url):
+            captured.append(url)
+            return SCHOLAR_RESULT_HTML
+
+        with patch("vibescholar.online._fetch_scholar_page", mock_fetch):
+            await search_google_scholar("attention", offset=0)
+
+        assert "start=" not in captured[0]
+
 
 # ── TestFormatOnlineResults (server.py helper) ────────────────────
 
@@ -506,7 +632,7 @@ class TestMCPToolsCitedBy:
             doi=None, arxiv_id=None, open_access_url=None, external_ids={},
         )]
 
-        async def mock_cited_by(title, limit):
+        async def mock_cited_by(title, limit, **kwargs):
             return papers
 
         with patch("vibescholar.online.cited_by", mock_cited_by):
@@ -519,13 +645,66 @@ class TestMCPToolsCitedBy:
     async def test_no_results(self):
         import server
 
-        async def mock_cited_by(title, limit):
+        async def mock_cited_by(title, limit, **kwargs):
             return []
 
         with patch("vibescholar.online.cited_by", mock_cited_by):
             result = await server.cited_by_online("Unknown Paper")
 
         assert "No citing papers found" in result
+
+    @pytest.mark.asyncio
+    async def test_paper_id_passes_cached_url(self):
+        """When paper_id is provided, cited_by_url from cache is forwarded."""
+        import server
+
+        # Cache a paper with a cited_by_url in external_ids
+        cached = PaperResult(
+            paper_id="s2_abc", title="Cached Paper", authors=["Alice"],
+            year=2020, venue="NeurIPS", citation_count=100, abstract="",
+            doi=None, arxiv_id=None, open_access_url=None,
+            external_ids={"cited_by_url": "/scholar?cites=99999&hl=en"},
+        )
+        server._paper_cache["s2_abc"] = cached
+
+        captured_kwargs: dict = {}
+
+        async def mock_cited_by(title, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return [PaperResult(
+                paper_id="gs_0", title="Citer", authors=["Bob"],
+                year=2023, venue="ICML", citation_count=5, abstract="",
+                doi=None, arxiv_id=None, open_access_url=None, external_ids={},
+            )]
+
+        with patch("vibescholar.online.cited_by", mock_cited_by):
+            result = await server.cited_by_online("Cached Paper", paper_id="s2_abc")
+
+        assert captured_kwargs.get("cited_by_url") == "/scholar?cites=99999&hl=en"
+        assert "Citer" in result
+
+    @pytest.mark.asyncio
+    async def test_paper_id_no_cached_url_falls_back(self):
+        """When paper_id is given but no cited_by_url in cache, falls back to title."""
+        import server
+
+        cached = PaperResult(
+            paper_id="s2_nocite", title="No Cites", authors=["Alice"],
+            year=2020, venue="", citation_count=0, abstract="",
+            doi=None, arxiv_id=None, open_access_url=None, external_ids={},
+        )
+        server._paper_cache["s2_nocite"] = cached
+
+        captured_kwargs: dict = {}
+
+        async def mock_cited_by(title, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return []
+
+        with patch("vibescholar.online.cited_by", mock_cited_by):
+            await server.cited_by_online("No Cites", paper_id="s2_nocite")
+
+        assert captured_kwargs.get("cited_by_url") is None
 
 
 class TestMCPToolsRelated:
@@ -539,7 +718,7 @@ class TestMCPToolsRelated:
             doi=None, arxiv_id=None, open_access_url=None, external_ids={},
         )]
 
-        async def mock_related(title, limit):
+        async def mock_related(title, limit, **kwargs):
             return papers
 
         with patch("vibescholar.online.related_papers", mock_related):
@@ -552,13 +731,42 @@ class TestMCPToolsRelated:
     async def test_no_results(self):
         import server
 
-        async def mock_related(title, limit):
+        async def mock_related(title, limit, **kwargs):
             return []
 
         with patch("vibescholar.online.related_papers", mock_related):
             result = await server.related_papers_online("Unknown")
 
         assert "No related papers found" in result
+
+    @pytest.mark.asyncio
+    async def test_paper_id_passes_cached_url(self):
+        """When paper_id is provided, related_url from cache is forwarded."""
+        import server
+
+        cached = PaperResult(
+            paper_id="s2_rel", title="Cached Paper", authors=["Alice"],
+            year=2020, venue="NeurIPS", citation_count=100, abstract="",
+            doi=None, arxiv_id=None, open_access_url=None,
+            external_ids={"related_url": "/scholar?q=related:xyz:scholar.google.com/&hl=en"},
+        )
+        server._paper_cache["s2_rel"] = cached
+
+        captured_kwargs: dict = {}
+
+        async def mock_related(title, limit, **kwargs):
+            captured_kwargs.update(kwargs)
+            return [PaperResult(
+                paper_id="gs_0", title="Similar Work", authors=["Bob"],
+                year=2023, venue="ICML", citation_count=5, abstract="",
+                doi=None, arxiv_id=None, open_access_url=None, external_ids={},
+            )]
+
+        with patch("vibescholar.online.related_papers", mock_related):
+            result = await server.related_papers_online("Cached Paper", paper_id="s2_rel")
+
+        assert "related:" in captured_kwargs.get("related_url", "")
+        assert "Similar Work" in result
 
 
 class TestMCPToolsAuthor:

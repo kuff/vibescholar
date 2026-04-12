@@ -1,17 +1,18 @@
 # VibeScholar
 
-MCP server that gives Claude access to a curated local corpus of top-tier venue papers and the wider academic literature via Google Scholar.
+MCP server that gives Claude access to academic literature — Google Scholar search with Semantic Scholar enrichment, citation tracking, author profiles, and an optional local PDF corpus.
 
 ## Architecture
 
-Two retrieval paths: a **curated local corpus** of vetted, top-tier research (CVPR, NeurIPS, ICML, etc.) and **online search** for supplementary context from the wider literature.
+Two retrieval paths: **online search** (primary) for the wider academic literature, and an optional **local corpus** for personally-indexed PDFs.
 
 ```
-Local:    Query → FAISS (semantic, HNSW) ─┐
-                                           ├→ RRF fusion → Cross-encoder rerank → Results
-          Query → FTS5  (keyword)  ────────┘
+Online:   Query → Google Scholar (headless Chromium) → S2 enrichment → Results
+                                                                     ↘ PDF cascade → In-memory text extraction
 
-Online:   Query → Google Scholar (headless Chromium) → PDF cascade → In-memory text extraction
+Local:    Query → FAISS (semantic, HNSW) ─┐
+                                          ├→ RRF fusion → Cross-encoder rerank → Results
+          Query → FTS5  (keyword)  ───────┘
 ```
 
 **Stack:** FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX) · FAISS HNSW · SQLite FTS5 · FlashRank cross-encoder · Google Scholar (Playwright) · Semantic Scholar · Unpaywall · FastMCP
@@ -29,45 +30,6 @@ For running tests:
 
 ```bash
 pip install -e ".[test]"
-```
-
-### Index PDFs
-
-Use the CLI indexer for a directory of PDFs:
-
-```bash
-python index_corpus.py /path/to/pdfs
-```
-
-Options:
-
-```
---data-dir DIR    Store the index in DIR instead of ~/.vibescholar
---cuda            Use GPU for embedding (requires onnxruntime-gpu)
---workers N       Parallel PDF extraction workers (default: CPU count)
-```
-
-Or use the Python API:
-
-```python
-from pathlib import Path
-from vibescholar import config
-from vibescholar.db import IndexDatabase
-from vibescholar.embeddings import Embedder
-from vibescholar.vectors import FaissStore
-from vibescholar.indexer import PdfIndexer
-
-config.configure()
-config.ensure_data_dirs()
-
-embedder = Embedder()
-db = IndexDatabase(config.DB_PATH)
-store = FaissStore(config.FAISS_INDEX_PATH, embedder.dimension)
-indexer = PdfIndexer(db, embedder, store)
-
-dir_id = db.upsert_directory("/path/to/pdfs")
-indexer.index_directory(dir_id, Path("/path/to/pdfs"))
-store.save()
 ```
 
 ### Configure as MCP server
@@ -111,46 +73,21 @@ Then expose via a reverse proxy or Tailscale Funnel. The server runs in stateles
 
 ## MCP Tools
 
-### Curated local corpus
+### Online (primary)
 
-The local corpus is your vetted collection of top-tier venue work. Always search here first.
+The primary research tools. Google Scholar results are transparently enriched with Semantic Scholar metadata (stable IDs, full abstracts, DOIs) so papers remain accessible across sessions.
 
-#### `search_papers(query, top_k=10, directory="", detail="detailed")`
+#### `search_online(query, limit=10, detail="detailed", year_min=None, year_max=None, sort="relevance", offset=0)`
 
-Primary search tool. Hybrid semantic + keyword retrieval with cross-encoder reranking over the curated corpus.
+Primary search tool for literature discovery.
 
-Supports search operators: `AND`, `OR`, `NOT`, `"quoted phrases"`, `prefix*`.
-
-```
-search_papers("neural network AND optimization")
-search_papers('"optimal transport"', top_k=5, detail="brief")
-search_papers("deep learning", directory="CVPR")
-```
-
-#### `read_document(file_path, pages=None)`
-
-Read full text from a paper in the curated corpus. Accepts full path, filename, or stem.
+Supports Google Scholar operators: `"quoted phrases"`, `OR`, `-exclude`, `intitle:`, `author:`, `source:`.
 
 ```
-read_document("paper.pdf", pages=[1, 2, 3])
-read_document("Meta_Optimal_Transport")
-```
-
-#### `list_indexed()`
-
-List all directories and papers in the curated corpus with status and chunk counts.
-
-### Online (supplementary)
-
-Use online tools when the local corpus does not cover the topic, or when you need supplementary context, background, citations, or recent work not yet in the vetted collection.
-
-#### `search_online(query, limit=10, detail="detailed")`
-
-Search Google Scholar for papers beyond the curated corpus.
-
-```
-search_online("attention mechanism transformer", limit=5)
-search_online("graph neural networks", detail="brief")
+search_online("neural radiance field")
+search_online("diffusion models", year_min=2023, sort="date")
+search_online("attention mechanism", limit=10, offset=10)   # page 2
+search_online("author:hinton deep learning", detail="brief")
 ```
 
 #### `fetch_paper(paper_id, pages=None)`
@@ -165,17 +102,18 @@ fetch_paper("DOI:10.48550/arXiv.1706.03762", pages=[1, 2])
 fetch_paper("ArXiv:1706.03762")
 ```
 
-#### `cited_by_online(title, limit=10, detail="detailed")`
+#### `cited_by_online(title, limit=10, detail="detailed", paper_id="")`
 
-Find papers that cite a given work. Works for both local corpus papers and any other paper — just provide the title.
+Find papers that cite a given work. Provide the title; optionally pass `paper_id` from a prior `search_online` result to skip the initial title lookup.
 
 ```
 cited_by_online("Attention Is All You Need", limit=5)
+cited_by_online("Attention Is All You Need", paper_id="204e3073...")
 ```
 
-#### `related_papers_online(title, limit=10, detail="detailed")`
+#### `related_papers_online(title, limit=10, detail="detailed", paper_id="")`
 
-Find papers related to a given work via Google Scholar's "Related articles" feature.
+Find related papers via Google Scholar's "Related articles" feature. Same `paper_id` shortcut as `cited_by_online`.
 
 ```
 related_papers_online("Generative Adversarial Networks")
@@ -191,11 +129,48 @@ author_papers_online("Yann LeCun", limit=10)
 
 #### `save_paper(paper, directory)`
 
-Save a PDF to a specified directory for offline reference. Works for both local corpus papers (by path/filename/stem) and online papers (by Semantic Scholar ID, DOI, or ArXiv ID). Tries to resolve locally first, then falls back to online download.
+Save a PDF to a specified directory for offline reference. Works for both local corpus papers (by filename/stem) and online papers (by Semantic Scholar ID, DOI, or ArXiv ID). Tries to resolve locally first, then falls back to online download.
 
 ```
-save_paper("attention", "/home/user/references")
 save_paper("DOI:10.48550/arXiv.1706.03762", "/home/user/references")
+```
+
+### Local corpus (secondary)
+
+Optional tools for searching a personally-indexed collection of PDFs. Use `index_papers` to add folders, then `search_local` to search within them.
+
+#### `search_local(query, top_k=10, directory="", detail="detailed")`
+
+Search your locally indexed PDF library. Hybrid semantic + keyword retrieval with cross-encoder reranking.
+
+Supports FTS5 operators: `AND`, `OR`, `NOT`, `"quoted phrases"`, `prefix*`.
+
+```
+search_local("neural network AND optimization")
+search_local('"optimal transport"', top_k=5, detail="brief")
+search_local("deep learning", directory="CVPR")
+```
+
+#### `read_document(file_path, pages=None)`
+
+Read full text from a paper in the local corpus. Accepts filename or stem.
+
+```
+read_document("paper.pdf", pages=[1, 2, 3])
+read_document("Meta_Optimal_Transport")
+```
+
+#### `list_indexed()`
+
+List all indexed directories with file counts, chunk counts, and status.
+
+#### `index_papers(folder, force=False)`
+
+Index a folder of PDFs into the local corpus. Scans for PDFs and makes them searchable via `search_local`. Already-indexed files are skipped unless `force=True`.
+
+```
+index_papers("/path/to/papers")
+index_papers("/path/to/papers", force=True)
 ```
 
 ### Context management
@@ -203,7 +178,7 @@ save_paper("DOI:10.48550/arXiv.1706.03762", "/home/user/references")
 All search and discovery tools accept a `detail` parameter:
 
 - `"brief"` — compact output for scanning many results (titles, scores, authors only)
-- `"detailed"` — full output with snippets (local) or abstracts (online)
+- `"detailed"` ��� full output with snippets (local) or abstracts (online)
 
 ## Configuration
 
@@ -223,35 +198,10 @@ Data directory layout:
   model_cache/        # FastEmbed + FlashRank model files
 ```
 
-## CLI Testing
-
-```bash
-python query.py "your search query"
-python query.py "your query" --top_k 10 --no-rerank
-python query.py --stats
-
-# Live test of online search (requires Playwright + internet)
-python test_online_live.py "optimal transport"
-python test_online_live.py "diffusion models" --fetch
-python test_online_live.py "attention" --save /tmp/papers
-```
-
-## Benchmarking
-
-```bash
-python benchmark.py                    # default queries, top_k=5, 3 rounds
-python benchmark.py --top_k 10         # custom top_k
-python benchmark.py --rounds 5         # repeat each query N times
-python benchmark.py --no-rerank        # skip cross-encoder reranking
-python benchmark.py --queries "query1" "query2"  # custom queries
-```
-
-Reports per-stage latency breakdown (embedding, FAISS, FTS5, RRF, DB fetch, reranking, snippets) with mean/median/P95/min/max statistics.
-
 ## Running Tests
 
 ```bash
-# Fast unit tests (~6s, 216 tests)
+# Fast unit tests (~6s)
 python -m pytest tests/ -v --ignore=tests/test_index_and_retrieval.py
 
 # Full suite including integration tests (~2 min)
@@ -270,12 +220,8 @@ vibescholar/
   reranker.py    # FlashRank cross-encoder wrapper
   indexer.py     # PDF text extraction, chunking, and embedding
   text.py        # Text utilities (clean_text, chunk_text)
-  online.py      # Google Scholar search, S2/Unpaywall clients, PDF cascade
-server.py        # MCP server entry point (9 tools)
-index_corpus.py  # CLI corpus indexer with parallel extraction
-query.py         # CLI search testing utility
-benchmark.py     # Search latency benchmarking
-tests/           # 216 tests across 10 test files
+  online.py      # Google Scholar, S2 enrichment, PDF cascade
+server.py        # MCP server entry point (10 tools)
 ```
 
 ## License
