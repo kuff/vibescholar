@@ -1,6 +1,16 @@
 # VibeScholar
 
-MCP server that gives Claude (or any MCP client) direct access to the academic literature. Searches Google Scholar via headless Chromium for full coverage of the academic web, enriches results with Semantic Scholar metadata for stable IDs and abstracts, fetches and reads full-text PDFs on demand, and optionally searches a locally indexed PDF corpus with hybrid semantic + keyword retrieval.
+*An MCP server that turns your AI assistant into an academic research partner — Google Scholar search, Semantic Scholar enrichment, full-text PDF reading, citation graphs, and a local PDF corpus with hybrid retrieval.*
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## What is this?
+
+This is an [MCP](https://modelcontextprotocol.io/) server for academic literature discovery. It gives Claude (or any MCP client) 10 tools for finding, reading, and navigating papers. The primary search path goes through Google Scholar via headless Chromium — so you get the full academic web, not just what's in a single API's index — and every result is transparently enriched with Semantic Scholar metadata (stable paper IDs, full abstracts, DOIs, citation counts) so papers stay addressable across sessions.
+
+When you find a paper worth reading, `fetch_paper` resolves a PDF through a four-source cascade (S2 Open Access, ArXiv, Unpaywall, publisher direct), extracts the text in memory, and returns it as context. No downloads, no local state — just the text, ready to read.
+
+There's also an optional local corpus mode: point `index_papers` at a folder of PDFs and they become searchable via hybrid FAISS semantic + SQLite FTS5 keyword retrieval, fused with Reciprocal Rank Fusion and reranked by a FlashRank cross-encoder.
 
 ## What does this look like?
 
@@ -39,9 +49,19 @@ You: Find recent papers on neural scaling laws and summarize the key results.
 Claude reads the full text and synthesizes an answer for you.
 ```
 
-All 10 tools work this way — Claude decides when to call them based on your research question.
+All 10 tools work this way — Claude decides when to call them based on your research question. You can ask it to search, follow citations, look up an author's publications, or read specific pages of a paper, and it picks the right tool calls.
 
-## Setup
+## Features
+
+- **Google Scholar search** via headless Chromium (Playwright) for full academic web coverage — not limited to a single API's index
+- **Semantic Scholar enrichment** gives every result stable IDs, full abstracts, DOIs, and citation counts that persist across sessions
+- **Full-text PDF reading** through a four-source resolution cascade (S2 Open Access → ArXiv → Unpaywall → publisher direct), extracted in memory and returned as context
+- **Citation tracking** — find papers that cite a given work, or discover related papers through Scholar's "Related articles"
+- **Author profiles** — list a researcher's publications from their Google Scholar profile
+- **Local PDF corpus** with hybrid FAISS semantic + FTS5 keyword search, Reciprocal Rank Fusion, and FlashRank cross-encoder reranking
+- **Remote access** via HTTP transport with Tailscale Funnel support for serving the MCP to Claude on other machines
+
+## Installation
 
 Requires Python 3.11+.
 
@@ -146,6 +166,19 @@ Data directory layout:
   model_cache/        # FastEmbed + FlashRank model files
 ```
 
+## Requirements
+
+- [Claude Code](https://claude.com/claude-code) or any MCP-compatible client
+- Python 3.11+
+- Playwright with Chromium (`playwright install chromium`)
+- Optional: [Semantic Scholar API key](https://www.semanticscholar.org/product/api#api-key-form) for higher rate limits
+
+## Scope and non-goals
+
+- **Online papers are ephemeral.** `fetch_paper` extracts text in memory and discards the PDF. Nothing is written to the database or FAISS index. Use `save_paper` if you want a local copy, or `index_papers` to make a folder of PDFs searchable.
+- **Google Scholar scraping is rate-limited.** Playwright drives a real Chromium instance to avoid trivial blocking, but Scholar will throttle aggressive use. This is designed for conversational research, not bulk harvesting.
+- **Not a citation manager.** VibeScholar finds and reads papers — it doesn't manage bibliographies, export BibTeX, or track your reading list.
+
 ## Testing
 
 ```bash
@@ -157,6 +190,10 @@ python -m pytest tests/ -v --ignore=tests/test_index_and_retrieval.py
 # Full suite including integration tests (~2 min)
 python -m pytest tests/ -v
 ```
+
+## Contributing
+
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
