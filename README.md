@@ -1,21 +1,45 @@
 # VibeScholar
 
-MCP server that gives Claude access to academic literature — Google Scholar search with Semantic Scholar enrichment, citation tracking, author profiles, and an optional local PDF corpus.
+MCP server that gives Claude (or any MCP client) direct access to the academic literature. Searches Google Scholar via headless Chromium for full coverage of the academic web, enriches results with Semantic Scholar metadata for stable IDs and abstracts, fetches and reads full-text PDFs on demand, and optionally searches a locally indexed PDF corpus with hybrid semantic + keyword retrieval.
 
-## Architecture
+## What does this look like?
 
-Two retrieval paths: **online search** (primary) for the wider academic literature, and an optional **local corpus** for personally-indexed PDFs.
+You ask Claude a research question; it calls VibeScholar's tools to find and read papers. Example session (illustrative):
 
 ```
-Online:   Query → Google Scholar (headless Chromium) → S2 enrichment → Results
-                                                                     ↘ PDF cascade → In-memory text extraction
+You: Find recent papers on neural scaling laws and summarize the key results.
 
-Local:    Query → FAISS (semantic, HNSW) ─┐
-                                          ├→ RRF fusion → Cross-encoder rerank → Results
-          Query → FTS5  (keyword)  ───────┘
+ ── Claude calls search_online("neural scaling laws", year_min=2023, sort="date") ──
+
+  Found 10 papers on Google Scholar.
+
+  1. [a1b2c3d4e5f6] "Scaling Data-Constrained Language Models" (2024)
+     Muennighoff; Rush; Barak; Scao; Piktus et al.
+     NeurIPS | Cited by: 189
+     PDF: https://arxiv.org/pdf/2305.16264.pdf
+     Snippet: We investigate scaling language models in data-constrained
+     regimes ...
+
+  2. [f7e8d9c0b1a2] "Observational Scaling Laws" (2024)
+     Ruan; Maddison
+     NeurIPS | Cited by: 74
+     PDF: https://arxiv.org/pdf/2405.10938.pdf
+     Snippet: ...
+
+ ── Claude calls fetch_paper("a1b2c3d4e5f6") ──
+
+  Paper: "Scaling Data-Constrained Language Models" (2024)
+  Authors: Muennighoff; Rush; Barak; Scao; Piktus et al.
+  Source: ArXiv open access PDF
+  Pages: 1-42
+
+  --- Page 1 ---
+  Abstract. ...
+
+Claude reads the full text and synthesizes an answer for you.
 ```
 
-**Stack:** FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX) · FAISS HNSW · SQLite FTS5 · FlashRank cross-encoder · Google Scholar (Playwright) · Semantic Scholar · Unpaywall · FastMCP
+All 10 tools work this way — Claude decides when to call them based on your research question.
 
 ## Setup
 
@@ -26,17 +50,9 @@ pip install -e .
 playwright install chromium
 ```
 
-For running tests:
-
-```bash
-pip install -e ".[test]"
-```
-
 ### Configure as MCP server
 
 **Local (stdio transport, for Claude Code):**
-
-Add to your Claude Code MCP settings:
 
 ```json
 {
@@ -58,7 +74,7 @@ Add to your Claude Code MCP settings:
 python server.py --transport streamable-http --host 127.0.0.1 --port 8765
 ```
 
-Then expose via a reverse proxy or Tailscale Funnel. The server runs in stateless mode when using HTTP transport so it works behind proxies without session affinity.
+Then expose via a reverse proxy or Tailscale Funnel. The server runs in stateless mode when using HTTP transport so it works behind proxies without session affinity. See [REMOTE-SETUP.md](REMOTE-SETUP.md) for a full walkthrough.
 
 ```json
 {
@@ -71,114 +87,46 @@ Then expose via a reverse proxy or Tailscale Funnel. The server runs in stateles
 }
 ```
 
-## MCP Tools
+## Tools
 
 ### Online (primary)
 
-The primary research tools. Google Scholar results are transparently enriched with Semantic Scholar metadata (stable IDs, full abstracts, DOIs) so papers remain accessible across sessions.
+Google Scholar results are enriched with Semantic Scholar metadata (stable IDs, full abstracts, DOIs) so papers remain accessible across sessions.
 
-#### `search_online(query, limit=10, detail="detailed", year_min=None, year_max=None, sort="relevance", offset=0)`
+| Tool | What it does |
+|------|-------------|
+| `search_online` | Literature search with year filters, pagination, sort by relevance or date. Supports Scholar operators: `"quoted phrases"`, `OR`, `-exclude`, `intitle:`, `author:`, `source:`. |
+| `fetch_paper` | Fetch and read the full text of a paper. Accepts S2 IDs, DOIs (`DOI:10.1234/...`), or ArXiv IDs (`ArXiv:2401.12345`). PDF is read in memory, not saved. |
+| `cited_by_online` | Papers that cite a given work. |
+| `related_papers_online` | Related papers via Scholar's "Related articles". |
+| `author_papers_online` | A researcher's publications from their Scholar profile. |
+| `save_paper` | Download a PDF to a local directory for offline reference. |
 
-Primary search tool for literature discovery.
+### Local corpus (optional)
 
-Supports Google Scholar operators: `"quoted phrases"`, `OR`, `-exclude`, `intitle:`, `author:`, `source:`.
+For searching a personally-indexed collection of PDFs. Index a folder once, then search it with hybrid semantic + keyword retrieval and cross-encoder reranking.
 
-```
-search_online("neural radiance field")
-search_online("diffusion models", year_min=2023, sort="date")
-search_online("attention mechanism", limit=10, offset=10)   # page 2
-search_online("author:hinton deep learning", detail="brief")
-```
+| Tool | What it does |
+|------|-------------|
+| `search_local` | Hybrid search over indexed PDFs. Supports FTS5 operators: `AND`, `OR`, `NOT`, `"phrases"`, `prefix*`. |
+| `read_document` | Read full text from a locally indexed paper. |
+| `index_papers` | Index a folder of PDFs into the local corpus. |
+| `list_indexed` | Show indexed directories with file and chunk counts. |
 
-#### `fetch_paper(paper_id, pages=None)`
+All search tools accept a `detail` parameter: `"brief"` for compact output (titles, authors, scores) or `"detailed"` for full output with abstracts or text snippets.
 
-Retrieve and read the full text of a paper found via online search. Accepts Semantic Scholar IDs (from `search_online` results), DOIs (`DOI:10.1234/example`), or ArXiv IDs (`ArXiv:2401.12345`).
-
-The PDF is fetched into memory and returned as context — it is **not** added to the local corpus. If no PDF can be obtained, returns the available metadata and abstract as fallback.
-
-```
-fetch_paper("204e3073870fae3d05bcbc2f6a8e263d9b72e776")
-fetch_paper("DOI:10.48550/arXiv.1706.03762", pages=[1, 2])
-fetch_paper("ArXiv:1706.03762")
-```
-
-#### `cited_by_online(title, limit=10, detail="detailed", paper_id="")`
-
-Find papers that cite a given work. Provide the title; optionally pass `paper_id` from a prior `search_online` result to skip the initial title lookup.
+## Architecture
 
 ```
-cited_by_online("Attention Is All You Need", limit=5)
-cited_by_online("Attention Is All You Need", paper_id="204e3073...")
+Online:   Query → Google Scholar (headless Chromium) → S2 enrichment → Results
+                                                                     ↘ PDF cascade → In-memory text extraction
+
+Local:    Query → FAISS (semantic, HNSW) ─┐
+                                          ├→ RRF fusion → Cross-encoder rerank → Results
+          Query → FTS5  (keyword)  ───────┘
 ```
 
-#### `related_papers_online(title, limit=10, detail="detailed", paper_id="")`
-
-Find related papers via Google Scholar's "Related articles" feature. Same `paper_id` shortcut as `cited_by_online`.
-
-```
-related_papers_online("Generative Adversarial Networks")
-```
-
-#### `author_papers_online(author, limit=20, detail="detailed")`
-
-List a researcher's publications from their Google Scholar profile.
-
-```
-author_papers_online("Yann LeCun", limit=10)
-```
-
-#### `save_paper(paper, directory)`
-
-Save a PDF to a specified directory for offline reference. Works for both local corpus papers (by filename/stem) and online papers (by Semantic Scholar ID, DOI, or ArXiv ID). Tries to resolve locally first, then falls back to online download.
-
-```
-save_paper("DOI:10.48550/arXiv.1706.03762", "/home/user/references")
-```
-
-### Local corpus (secondary)
-
-Optional tools for searching a personally-indexed collection of PDFs. Use `index_papers` to add folders, then `search_local` to search within them.
-
-#### `search_local(query, top_k=10, directory="", detail="detailed")`
-
-Search your locally indexed PDF library. Hybrid semantic + keyword retrieval with cross-encoder reranking.
-
-Supports FTS5 operators: `AND`, `OR`, `NOT`, `"quoted phrases"`, `prefix*`.
-
-```
-search_local("neural network AND optimization")
-search_local('"optimal transport"', top_k=5, detail="brief")
-search_local("deep learning", directory="CVPR")
-```
-
-#### `read_document(file_path, pages=None)`
-
-Read full text from a paper in the local corpus. Accepts filename or stem.
-
-```
-read_document("paper.pdf", pages=[1, 2, 3])
-read_document("Meta_Optimal_Transport")
-```
-
-#### `list_indexed()`
-
-List all indexed directories with file counts, chunk counts, and status.
-
-#### `index_papers(folder, force=False)`
-
-Index a folder of PDFs into the local corpus. Scans for PDFs and makes them searchable via `search_local`. Already-indexed files are skipped unless `force=True`.
-
-```
-index_papers("/path/to/papers")
-index_papers("/path/to/papers", force=True)
-```
-
-### Context management
-
-All search and discovery tools accept a `detail` parameter:
-
-- `"brief"` — compact output for scanning many results (titles, scores, authors only)
-- `"detailed"` ��� full output with snippets (local) or abstracts (online)
+**Stack:** FastEmbed (BAAI/bge-small-en-v1.5, 384-dim ONNX) · FAISS HNSW · SQLite FTS5 · FlashRank cross-encoder · Google Scholar (Playwright) · Semantic Scholar · Unpaywall · FastMCP
 
 ## Configuration
 
@@ -198,30 +146,16 @@ Data directory layout:
   model_cache/        # FastEmbed + FlashRank model files
 ```
 
-## Running Tests
+## Testing
 
 ```bash
+pip install -e ".[test]"
+
 # Fast unit tests (~6s)
 python -m pytest tests/ -v --ignore=tests/test_index_and_retrieval.py
 
 # Full suite including integration tests (~2 min)
 python -m pytest tests/ -v
-```
-
-## Project Structure
-
-```
-vibescholar/
-  config.py      # Path configuration & environment variables
-  db.py          # SQLite schema, FTS5 full-text search, CRUD operations
-  embeddings.py  # FastEmbed wrapper (BAAI/bge-small-en-v1.5)
-  vectors.py     # FAISS HNSW vector store with soft deletion
-  search.py      # Hybrid search pipeline (FAISS + FTS5 + RRF + reranking)
-  reranker.py    # FlashRank cross-encoder wrapper
-  indexer.py     # PDF text extraction, chunking, and embedding
-  text.py        # Text utilities (clean_text, chunk_text)
-  online.py      # Google Scholar, S2 enrichment, PDF cascade
-server.py        # MCP server entry point (10 tools)
 ```
 
 ## License
