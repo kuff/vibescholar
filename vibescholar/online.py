@@ -808,12 +808,17 @@ async def _core_pdf_url(doi: str | None, title: str | None) -> str | None:
     CORE (core.ac.uk) aggregates open-access papers from thousands of
     repositories and often surfaces author-hosted preprints that are not
     indexed by Unpaywall.  Searches by DOI first; falls back to title.
+
+    Requires the ``CORE_API_KEY`` environment variable — the CORE v3 API
+    returns 401 for unauthenticated requests.  Returns ``None`` immediately
+    if the key is not set.
     """
-    client = get_http_client()
-    headers = {"User-Agent": _USER_AGENT}
     core_api_key = os.environ.get("CORE_API_KEY")
-    if core_api_key:
-        headers["Authorization"] = f"Bearer {core_api_key}"
+    if not core_api_key:
+        return None
+
+    client = get_http_client()
+    headers = {"User-Agent": _USER_AGENT, "Authorization": f"Bearer {core_api_key}"}
 
     queries: list[str] = []
     if doi:
@@ -873,6 +878,21 @@ async def _try_download_pdf(url: str) -> bytes | None:
         return None
 
     return resp.content
+
+
+def _pdf_title_matches(pdf_bytes: bytes, expected_title: str, threshold: float = 0.5) -> bool:
+    """Return True if *expected_title* appears in the first two pages of the PDF.
+
+    Uses a lower Jaccard threshold (default 0.5) than S2 enrichment to allow
+    for minor OCR differences or truncated titles in the PDF header.
+    Returns True when *expected_title* is empty (no check possible).
+    """
+    if not expected_title:
+        return True
+    text = _extract_text_from_pdf_bytes(pdf_bytes, pages=[1, 2])
+    if not text:
+        return True  # can't verify — assume OK rather than discarding
+    return _title_similarity(expected_title, text) >= threshold
 
 
 # ── In-memory PDF text extraction ─────────────────────────────────
@@ -979,10 +999,14 @@ async def _download_pdf_bytes(
     if core_url:
         pdf_bytes = await _try_download_pdf(core_url)
         if pdf_bytes is not None:
-            return pdf_bytes, "CORE", tried
-        tried.append(("CORE", f"download failed: {core_url[:80]}"))
+            if _pdf_title_matches(pdf_bytes, paper.title):
+                return pdf_bytes, "CORE", tried
+            logger.warning("CORE PDF title mismatch for '%s': %s", paper.title, core_url[:80])
+            tried.append(("CORE", f"title mismatch: {core_url[:80]}"))
+        else:
+            tried.append(("CORE", f"download failed: {core_url[:80]}"))
     else:
-        tried.append(("CORE", "no PDF found"))
+        tried.append(("CORE", "no PDF found (CORE_API_KEY not set or no result)"))
 
     # Last resort: search Google Scholar for a sidebar PDF link
     scholar_pdf = await _scholar_pdf_url_for_title(paper.title)
