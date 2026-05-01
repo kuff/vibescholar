@@ -17,6 +17,9 @@ Environment variables
 VIBESCHOLAR_DATA_DIR  Path to the data directory (default: ~/.vibescholar)
 S2_API_KEY            Optional Semantic Scholar API key (higher rate limits).
 VIBESCHOLAR_EMAIL     Email for the Unpaywall API.
+CORE_API_KEY          Optional CORE API key (higher rate limits).
+
+A ``.env`` file in the working directory (or any parent) is loaded automatically.
 """
 from __future__ import annotations
 
@@ -26,6 +29,12 @@ import re
 import sys
 from collections import OrderedDict
 from pathlib import Path, PureWindowsPath
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv is optional; fall back to plain env vars
 
 # ── Logging (must go to stderr for stdio transport) ─────────────────
 logging.basicConfig(
