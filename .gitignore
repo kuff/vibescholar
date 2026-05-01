@@ -32,6 +32,7 @@ tests/test_papers/
 # Environment
 .env
 .env.*
+!.env.example
 
 # Singularity
 *.sif
