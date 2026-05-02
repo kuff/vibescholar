@@ -35,6 +35,7 @@ _S2_FIELDS = (
     "abstract,openAccessPdf,externalIds"
 )
 _UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
+_CORE_BASE = "https://api.core.ac.uk/v3"
 _USER_AGENT = "VibeScholar/0.1 (academic research tool)"
 _MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
 _PDF_TIMEOUT = 30.0
@@ -767,7 +768,12 @@ def _resolve_pdf_sources(paper: PaperResult) -> list[tuple[str, str]]:
 
 
 async def _unpaywall_pdf_url(doi: str) -> str | None:
-    """Query Unpaywall for an open-access PDF URL."""
+    """Query Unpaywall for an open-access PDF URL.
+
+    Checks ``best_oa_location`` first, then falls back to scanning all
+    ``oa_locations`` in preference order so that author-hosted PDFs surfaced
+    only in secondary locations are not silently missed.
+    """
     client = get_http_client()
     try:
         resp = await client.get(
@@ -778,15 +784,81 @@ async def _unpaywall_pdf_url(doi: str) -> str | None:
         if resp.status_code != 200:
             return None
         body = resp.json()
+
+        # Collect all candidate locations: best first, then the rest
         best = body.get("best_oa_location") or {}
-        url = best.get("url_for_pdf")
-        if url:
-            return url
-        # Fall back to landing page URL (sometimes serves PDF directly)
-        return best.get("url")
+        all_locations: list[dict] = [best] if best else []
+        for loc in body.get("oa_locations") or []:
+            if loc not in all_locations:
+                all_locations.append(loc)
+
+        for loc in all_locations:
+            url = loc.get("url_for_pdf") or loc.get("url")
+            if url:
+                return url
+        return None
     except httpx.HTTPError as exc:
         logger.warning("Unpaywall error: %s", exc)
         return None
+
+
+async def _core_pdf_url(doi: str | None, title: str | None) -> str | None:
+    """Query the CORE API for an open-access PDF URL.
+
+    CORE (core.ac.uk) aggregates open-access papers from thousands of
+    repositories and often surfaces author-hosted preprints that are not
+    indexed by Unpaywall.  Searches by DOI first; falls back to title.
+
+    CORE api_key is required (set CORE_API_KEY in environment) to download pdf's
+    See https://core.ac.uk/services/api for details and registration.
+
+    """
+
+    client = get_http_client()
+    headers = {"User-Agent": _USER_AGENT}
+    core_api_key = os.environ.get("CORE_API_KEY")
+    if not core_api_key:
+        logger.info("No CORE API key found in environment; skipping CORE PDF lookup")
+        return None
+
+    headers["Authorization"] = f"Bearer {core_api_key}"
+
+    queries: list[str] = []
+    if doi:
+        queries.append(f'doi:"{doi}"')
+    if title:
+        queries.append(f'title:"{title}"')
+
+    for q in queries:
+        try:
+            resp = await client.get(
+                f"{_CORE_BASE}/search/works",
+                params={"q": q, "limit": 3},
+                headers=headers,
+                timeout=_API_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for result in data.get("results") or []:
+                # Verify title match when searching by title
+                if title and not doi:
+                    result_title = result.get("title") or ""
+                    if _title_similarity(title, result_title) < _S2_ENRICH_THRESHOLD:
+                        continue
+                # Prefer direct download URL
+                dl_url = result.get("downloadUrl")
+                if dl_url:
+                    return dl_url
+                # Fall back to any PDF link in the links array
+                for link in result.get("links") or []:
+                    if isinstance(link, dict) and link.get("type") == "download":
+                        return link.get("url")
+        except httpx.HTTPError as exc:
+            logger.debug("CORE API error: %s", exc)
+            continue
+
+    return None
 
 
 async def _try_download_pdf(url: str) -> bytes | None:
@@ -809,6 +881,21 @@ async def _try_download_pdf(url: str) -> bytes | None:
         return None
 
     return resp.content
+
+
+def _pdf_title_matches(pdf_bytes: bytes, expected_title: str, threshold: float = 0.5) -> bool:
+    """Return True if *expected_title* appears in the first two pages of the PDF.
+
+    Uses a lower Jaccard threshold (default 0.5) than S2 enrichment to allow
+    for minor OCR differences or truncated titles in the PDF header.
+    Returns True when *expected_title* is empty (no check possible).
+    """
+    if not expected_title:
+        return True
+    text = _extract_text_from_pdf_bytes(pdf_bytes, pages=[1, 2])
+    if not text:
+        return True  # can't verify — assume OK rather than discarding
+    return _title_similarity(expected_title, text) >= threshold
 
 
 # ── In-memory PDF text extraction ─────────────────────────────────
@@ -862,6 +949,26 @@ def _extract_text_from_pdf_bytes(
 # ── High-level fetch ──────────────────────────────────────────────
 
 
+async def _scholar_pdf_url_for_title(title: str) -> str | None:
+    """Search Google Scholar for *title* and return a PDF sidebar URL if found.
+
+    Only returns a URL when the top result has a Jaccard title similarity of
+    at least ``_S2_ENRICH_THRESHOLD`` (0.85) to avoid downloading the wrong paper.
+    """
+    if not title:
+        return None
+    url = f"{_SCHOLAR_BASE}?q={quote_plus(title)}&num=3&hl=en"
+    html = await _fetch_scholar_page(url)
+    if not html:
+        return None
+    for result in _parse_scholar_results(html)[:3]:
+        if _title_similarity(title, result.get("title", "")) >= _S2_ENRICH_THRESHOLD:
+            pdf_url = result.get("pdf_url")
+            if pdf_url:
+                return pdf_url
+    return None
+
+
 async def _download_pdf_bytes(
     paper: PaperResult,
 ) -> tuple[bytes | None, str | None, list[tuple[str, str]]]:
@@ -889,6 +996,30 @@ async def _download_pdf_bytes(
             continue
 
         return pdf_bytes, source_name, tried
+
+    # Second resort: CORE aggregator — often has author-hosted preprints not in Unpaywall
+    core_url = await _core_pdf_url(paper.doi, paper.title)
+    if core_url:
+        pdf_bytes = await _try_download_pdf(core_url)
+        if pdf_bytes is not None:
+            if _pdf_title_matches(pdf_bytes, paper.title):
+                return pdf_bytes, "CORE", tried
+            logger.warning("CORE PDF title mismatch for '%s': %s", paper.title, core_url[:80])
+            tried.append(("CORE", f"title mismatch: {core_url[:80]}"))
+        else:
+            tried.append(("CORE", f"download failed: {core_url[:80]}"))
+    else:
+        tried.append(("CORE", "no PDF found (CORE_API_KEY not set or no result)"))
+
+    # Last resort: search Google Scholar for a sidebar PDF link
+    scholar_pdf = await _scholar_pdf_url_for_title(paper.title)
+    if scholar_pdf:
+        pdf_bytes = await _try_download_pdf(scholar_pdf)
+        if pdf_bytes is not None:
+            return pdf_bytes, "Google Scholar", tried
+        tried.append(("Google Scholar", "download failed or not PDF"))
+    else:
+        tried.append(("Google Scholar", "no PDF link found"))
 
     summary = "; ".join(f"{name}: {reason}" for name, reason in tried)
     logger.info("No PDF obtained for '%s'. Tried: %s", paper.title, summary)
