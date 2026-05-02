@@ -809,13 +809,19 @@ async def _core_pdf_url(doi: str | None, title: str | None) -> str | None:
     repositories and often surfaces author-hosted preprints that are not
     indexed by Unpaywall.  Searches by DOI first; falls back to title.
 
+    CORE api_key is required (set CORE_API_KEY in environment) to download pdf's
+    See https://core.ac.uk/services/api for details and registration.
+
     """
 
     client = get_http_client()
     headers = {"User-Agent": _USER_AGENT}
     core_api_key = os.environ.get("CORE_API_KEY")
-    if core_api_key:
-        headers["Authorization"] = f"Bearer {core_api_key}"
+    if not core_api_key:
+        logger.info("No CORE API key found in environment; skipping CORE PDF lookup")
+        return None
+
+    headers["Authorization"] = f"Bearer {core_api_key}"
 
     queries: list[str] = []
     if doi:
