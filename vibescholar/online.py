@@ -809,16 +809,13 @@ async def _core_pdf_url(doi: str | None, title: str | None) -> str | None:
     repositories and often surfaces author-hosted preprints that are not
     indexed by Unpaywall.  Searches by DOI first; falls back to title.
 
-    Requires the ``CORE_API_KEY`` environment variable — the CORE v3 API
-    returns 401 for unauthenticated requests.  Returns ``None`` immediately
-    if the key is not set.
     """
-    core_api_key = os.environ.get("CORE_API_KEY")
-    if not core_api_key:
-        return None
 
     client = get_http_client()
-    headers = {"User-Agent": _USER_AGENT, "Authorization": f"Bearer {core_api_key}"}
+    headers = {"User-Agent": _USER_AGENT}
+    core_api_key = os.environ.get("CORE_API_KEY")
+    if core_api_key:
+        headers["Authorization"] = f"Bearer {core_api_key}"
 
     queries: list[str] = []
     if doi:
